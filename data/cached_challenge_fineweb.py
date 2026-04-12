@@ -32,11 +32,13 @@ def local_path_for_remote(relative_path: str) -> Path:
     return ROOT / remote_path
 
 
-def get(relative_path: str) -> None:
+def get(relative_path: str, *, overwrite: bool = False) -> None:
     destination = local_path_for_remote(relative_path)
-    if destination.exists():
+    if destination.exists() and not overwrite:
         return
     if destination.is_symlink():
+        destination.unlink()
+    elif overwrite and destination.exists():
         destination.unlink()
 
     remote_path = Path(relative_path)
@@ -62,14 +64,14 @@ def manifest_path() -> Path:
     return local_path_for_remote(f"{REMOTE_ROOT_PREFIX}/manifest.json")
 
 
-def load_manifest(*, skip_manifest_download: bool) -> dict:
+def load_manifest(*, skip_manifest_download: bool, refresh_manifest: bool) -> dict:
     path = manifest_path()
-    if not path.is_file():
+    if refresh_manifest or not path.is_file():
         if skip_manifest_download:
             raise FileNotFoundError(
                 f"manifest.json is required for manifest-driven shard counts but is not present locally at {path}"
             )
-        get(f"{REMOTE_ROOT_PREFIX}/manifest.json")
+        get(f"{REMOTE_ROOT_PREFIX}/manifest.json", overwrite=True)
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -110,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip downloading manifest.json.",
     )
     parser.add_argument(
+        "--refresh-manifest",
+        action="store_true",
+        help="Force re-download of manifest.json before resolving dataset paths.",
+    )
+    parser.add_argument(
         "--with-docs",
         action="store_true",
         help="Also download docs_selected.jsonl and its sidecar for tokenizer retraining or dataset re-export.",
@@ -124,7 +131,10 @@ def main() -> None:
     if train_shards < 0:
         raise ValueError("train_shards must be non-negative")
 
-    manifest = load_manifest(skip_manifest_download=args.skip_manifest)
+    manifest = load_manifest(
+        skip_manifest_download=args.skip_manifest,
+        refresh_manifest=args.refresh_manifest,
+    )
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir), None)
     if dataset_entry is None:
         raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
