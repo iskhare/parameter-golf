@@ -125,6 +125,7 @@ def run_profile(args: argparse.Namespace, profile: str) -> dict[str, object]:
             "TRAIN_LOG_EVERY": str(args.train_log_every),
             "WARMUP_STEPS": str(args.warmup_steps),
             "VAL_LOSS_EVERY": "0",
+            "SKIP_FINAL_PREQUANT_VAL": "1",
             "OUT_DIR": args.out_dir,
             "SEED": str(args.seed),
         }

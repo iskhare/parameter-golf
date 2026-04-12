@@ -68,6 +68,7 @@ class Hyperparameters:
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    skip_final_prequant_val: bool = bool(int(os.environ.get("SKIP_FINAL_PREQUANT_VAL", "0")))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1073,7 +1074,11 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        should_validate = (
+            (last_step and not args.skip_final_prequant_val)
+            or (not last_step and args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        )
+        if should_validate:
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             recur_enabled = recur_enabled_for_step(args, step)
