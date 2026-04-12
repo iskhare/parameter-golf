@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import glob
+import importlib.metadata
 import json
 import math
 import os
@@ -31,6 +32,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 # ==============================================================================
 
 COMPUTE_DTYPE = mx.bfloat16
+MLX_VERSION = getattr(mx, "__version__", importlib.metadata.version("mlx"))
 
 # ==============================================================================
 # HYPERPARAMETERS
@@ -80,6 +82,12 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    recur_layers: tuple[int, ...] = tuple(
+        int(x) for x in os.environ.get("RECUR_LAYERS", "").split(",") if x.strip()
+    )
+    recur_repeat_count: int = int(os.environ.get("RECUR_REPEAT_COUNT", 0))
+    recur_start_frac: float = float(os.environ.get("RECUR_START_FRAC", 0.0))
+    parallel_start_layer: int = int(os.environ.get("PARALLEL_START_LAYER", -1))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -93,6 +101,9 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    weight_decay_embed: float = float(os.environ.get("WEIGHT_DECAY_EMBED", 0.0))
+    weight_decay_matrix: float = float(os.environ.get("WEIGHT_DECAY_MATRIX", 0.0))
+    weight_decay_scalar: float = float(os.environ.get("WEIGHT_DECAY_SCALAR", 0.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -360,12 +371,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        parallel_residual: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.parallel_residual = parallel_residual
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -374,8 +387,14 @@ class Block(nn.Module):
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_scale = self.attn_scale.astype(x.dtype)[None, None, :]
+        mlp_scale = self.mlp_scale.astype(x.dtype)[None, None, :]
+        if self.parallel_residual:
+            mlp_out = self.mlp(self.mlp_norm(x))
+            x = x + attn_scale * attn_out + mlp_scale * mlp_out
+        else:
+            x = x + attn_scale * attn_out
+            x = x + mlp_scale * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -386,12 +405,15 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, recur_layers: tuple[int, ...], recur_repeat_count: int,
+                 parallel_start_layer: int):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.recur_layers = frozenset(recur_layers)
+        self.recur_repeat_count = max(recur_repeat_count, 0)
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -399,7 +421,15 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(
+                dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                parallel_residual=parallel_start_layer >= 0 and i >= parallel_start_layer,
+            )
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -415,13 +445,26 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def run_block(self, idx: int, x: mx.array, x0: mx.array, recur_enabled: mx.array) -> mx.array:
+        block = self.blocks[idx]
+        x = block(x, x0)
+        if idx not in self.recur_layers or self.recur_repeat_count <= 0:
+            return x
+        recur_gate = recur_enabled.astype(x.dtype)
+        for _ in range(self.recur_repeat_count):
+            candidate = block(x, x0)
+            x = x + recur_gate * (candidate - x)
+        return x
+
+    def __call__(self, input_ids: mx.array, recur_enabled: mx.array | None = None) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
+        if recur_enabled is None:
+            recur_enabled = mx.array(0.0, dtype=mx.float32)
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.run_block(i, x, x0, recur_enabled)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -429,13 +472,13 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.run_block(self.num_encoder_layers + i, x, x0, recur_enabled)
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+    def loss(self, input_ids: mx.array, target_ids: mx.array, recur_enabled: mx.array | None = None) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x = self(input_ids, recur_enabled=recur_enabled).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -478,7 +521,8 @@ class Muon:
             g_eff = g + momentum * buf
             g_ortho = zeropower_newtonschulz5(g_eff, self.args.muon_backend_steps)
             scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
-            out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
+            decay = 1.0 - lr * self.args.weight_decay_matrix
+            out[k] = p * decay - lr * (g_ortho * scale).astype(p.dtype)
         return out
 
 
@@ -530,11 +574,17 @@ class SplitOptimizers:
                 {self.embed_key: params[self.embed_key]},
             )
         )
+        if self.args.weight_decay_embed:
+            updated[self.embed_key] = updated[self.embed_key] * (1.0 - self.args.tied_embed_lr * lr_mul * self.args.weight_decay_embed)
 
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
         scalar_params = {k: params[k] for k in self.scalar_keys}
         updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
+        if self.args.weight_decay_scalar:
+            scalar_decay = 1.0 - self.args.scalar_lr * lr_mul * self.args.weight_decay_scalar
+            for k in self.scalar_keys:
+                updated[k] = updated[k] * scalar_decay
 
         model.update(tree_unflatten(list(updated.items())))
 
@@ -742,6 +792,7 @@ def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
     compiled_loss_and_grad,
+    recur_enabled: mx.array,
 ) -> tuple[mx.array, dict]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
@@ -749,7 +800,7 @@ def loss_and_grad_chunked(
     grad_accum: dict[str, mx.array] | None = None
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
-        loss, grads = compiled_loss_and_grad(x, y)
+        loss, grads = compiled_loss_and_grad(x, y, recur_enabled)
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
@@ -833,6 +884,15 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def recur_enabled_for_step(args: Hyperparameters, step: int) -> mx.array:
+    if not args.recur_layers or args.recur_repeat_count <= 0:
+        return mx.array(0.0, dtype=mx.float32)
+    if args.recur_start_frac <= 0.0:
+        return mx.array(1.0, dtype=mx.float32)
+    enabled = float(step >= math.ceil(args.iterations * args.recur_start_frac))
+    return mx.array(enabled, dtype=mx.float32)
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -853,7 +913,7 @@ def main() -> None:
     log(code, console=False)
     log("=" * 100, console=False)
     log(f"Running Python {sys.version}", console=False)
-    log(f"Running MLX {mx.__version__}", console=False)
+    log(f"Running MLX {MLX_VERSION}", console=False)
     log("=" * 100, console=False)
 
     if not args.tie_embeddings:
@@ -897,6 +957,9 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        recur_layers=args.recur_layers,
+        recur_repeat_count=args.recur_repeat_count,
+        parallel_start_layer=args.parallel_start_layer,
     )
     opt = SplitOptimizers(model, args)
 
@@ -907,9 +970,9 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    compiled_loss = mx.compile(lambda x, y, recur_enabled: model.loss(x, y, recur_enabled), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        nn.value_and_grad(model, lambda x, y, recur_enabled: model.loss(x, y, recur_enabled)),
         inputs=model.state,
         outputs=model.state,
     )
@@ -917,7 +980,7 @@ def main() -> None:
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
-    log(f"mlx_version:{mx.__version__}")
+    log(f"mlx_version:{MLX_VERSION}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
     if expected_train_files is None:
@@ -937,6 +1000,11 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
+        f"arch: mlp_mult:{args.mlp_mult} qk_gain_init:{args.qk_gain_init} "
+        f"recur_layers:{','.join(map(str, args.recur_layers)) or 'off'} recur_repeat_count:{args.recur_repeat_count} "
+        f"recur_start_frac:{args.recur_start_frac:.3f} parallel_start_layer:{args.parallel_start_layer}"
+    )
+    log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
         f"val_batch_size:{args.val_batch_size} "
@@ -947,7 +1015,9 @@ def main() -> None:
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps} "
+        f"weight_decay_embed:{args.weight_decay_embed} weight_decay_matrix:{args.weight_decay_matrix} "
+        f"weight_decay_scalar:{args.weight_decay_scalar}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
@@ -969,8 +1039,9 @@ def main() -> None:
             accum: dict[str, mx.array] | None = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
+            recur_enabled = recur_enabled_for_step(args, warmup_step)
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad, recur_enabled)
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -989,7 +1060,7 @@ def main() -> None:
         warm_chunk = val_tokens[: warm_val_seqs * args.train_seq_len + 1]
         x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
         y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
-        warm_val_loss = compiled_loss(x_val, y_val)
+        warm_val_loss = compiled_loss(x_val, y_val, recur_enabled_for_step(args, 0))
         mx.eval(warm_val_loss)
         mx.synchronize()
 
@@ -1005,9 +1076,10 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
+            recur_enabled = recur_enabled_for_step(args, step)
             val_loss, val_bpb = eval_val(
                 args,
-                compiled_loss,
+                lambda x, y: compiled_loss(x, y, recur_enabled),
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
@@ -1027,12 +1099,13 @@ def main() -> None:
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
+        recur_enabled = recur_enabled_for_step(args, step)
 
         accum: dict[str, mx.array] | None = None
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad, recur_enabled)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
             if args.mlx_eager_eval:
@@ -1051,7 +1124,8 @@ def main() -> None:
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f} "
+                f"recur_enabled:{int(float(recur_enabled.item()))}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
@@ -1086,9 +1160,10 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
+    final_recur_enabled = recur_enabled_for_step(args, step)
     q_val_loss, q_val_bpb = eval_val(
         args,
-        compiled_loss,
+        lambda x, y: compiled_loss(x, y, final_recur_enabled),
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
