@@ -1,0 +1,10 @@
+Loaded EMA checkpoint: /workspace/parameter-golf/tmp/gdn_frontier/checkpoints_exact1337/final_model_D_GDN_Hybrid_seed1337.pt
+Validation tokens: 62,021,632
+EMA BPB (no XSA): 1.007132
+Generating GPTQ calibration sequences
+Collected 64 calibration sequences
+Collected hessians for 29 layers
+Artifact: 15,987,204 bytes
+Quantized BPB (no XSA): 1.015806
+Quantization degradation: +0.008674
+Quantized BPB (XSA-all): 1.020281
